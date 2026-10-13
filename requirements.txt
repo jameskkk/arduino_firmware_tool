@@ -1,0 +1,3 @@
+# Optional but recommended: shows friendly USB serial-port names.
+pyserial>=3.5
+
