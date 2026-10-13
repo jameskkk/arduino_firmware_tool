@@ -54,6 +54,24 @@ class AppOptions:
     mcu: str = "atmega328p"
 
 
+@dataclass(frozen=True)
+class IspAppOptions:
+    avrdude: str
+    hex_file: str
+    programmer: str = "usbtiny"
+    port: str = ""
+    config_file: str = ""
+    bitclock: str = ""
+    mcu: str = "atmega328p"
+    preserve_bootloader: bool = False
+    bootloader_hex_file: str = ""
+    low_fuse: str = "0xFF"
+    high_fuse: str = "0xDE"
+    extended_fuse: str = "0xFD"
+    unlock_bits: str = "0x3F"
+    lock_bits: str = "0x0F"
+
+
 def normalize_hex_byte(value: str, label: str) -> str:
     value = value.strip()
     if not re.fullmatch(r"(?:0[xX])?[0-9a-fA-F]{1,2}", value):
@@ -204,6 +222,57 @@ def build_app_command(options: AppOptions) -> list[str]:
             "-D",
             "-U",
             f"flash:w:{options.hex_file}:i",
+        ]
+    )
+    return command
+
+
+def build_isp_app_command(options: IspAppOptions) -> list[str]:
+    """Build a direct ISP App command, optionally restoring Optiboot afterward.
+
+    ISP Flash updates require a chip erase so that zero bits can return to one.
+    Consequently, direct mode removes any existing bootloader. Preserve mode
+    writes the App and Bootloader after the same erase, then restores lock bits.
+    """
+    if not options.programmer.strip():
+        raise FlashError("請指定 ISP Programmer。")
+    if options.preserve_bootloader and not options.bootloader_hex_file.strip():
+        raise FlashError("保留 Bootloader 時必須選擇 Bootloader HEX。")
+
+    command = _base_command(
+        options.avrdude, options.config_file, options.mcu, options.programmer
+    )
+    if options.port.strip():
+        command.extend(["-P", options.port.strip()])
+    if options.bitclock.strip():
+        command.extend(["-B", options.bitclock.strip()])
+    command.append("-e")
+
+    if not options.preserve_bootloader:
+        command.extend(["-U", f"flash:w:{options.hex_file}:i"])
+        return command
+
+    low = normalize_hex_byte(options.low_fuse, "Low fuse")
+    high = normalize_hex_byte(options.high_fuse, "High fuse")
+    extended = normalize_hex_byte(options.extended_fuse, "Extended fuse")
+    unlock = normalize_hex_byte(options.unlock_bits, "Unlock bits")
+    lock = normalize_hex_byte(options.lock_bits, "Lock bits")
+    command.extend(
+        [
+            "-U",
+            f"lock:w:{unlock}:m",
+            "-U",
+            f"efuse:w:{extended}:m",
+            "-U",
+            f"hfuse:w:{high}:m",
+            "-U",
+            f"lfuse:w:{low}:m",
+            "-U",
+            f"flash:w:{options.hex_file}:i",
+            "-U",
+            f"flash:w:{options.bootloader_hex_file}:i",
+            "-U",
+            f"lock:w:{lock}:m",
         ]
     )
     return command
