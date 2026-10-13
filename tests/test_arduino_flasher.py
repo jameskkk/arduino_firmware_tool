@@ -7,8 +7,10 @@ from arduino_flasher import (
     AvrdudeProgressParser,
     BootloaderOptions,
     FlashError,
+    IspAppOptions,
     build_app_command,
     build_bootloader_command,
+    build_isp_app_command,
     validate_hex_file,
 )
 
@@ -55,6 +57,38 @@ class CommandTests(unittest.TestCase):
     def test_app_requires_port(self) -> None:
         with self.assertRaisesRegex(FlashError, "序列埠"):
             build_app_command(AppOptions("avrdude", "app.hex", port=""))
+
+    def test_usbtiny_can_flash_app_without_serial_port(self) -> None:
+        command = build_isp_app_command(
+            IspAppOptions("avrdude", "app.hex", programmer="usbtiny")
+        )
+        self.assertIn("-e", command)
+        self.assertNotIn("-P", command)
+        self.assertNotIn("-D", command)
+        self.assertEqual(command[-1], "flash:w:app.hex:i")
+
+    def test_isp_app_can_restore_bootloader_in_same_erase_cycle(self) -> None:
+        command = build_isp_app_command(
+            IspAppOptions(
+                "avrdude",
+                "app.hex",
+                programmer="usbtiny",
+                preserve_bootloader=True,
+                bootloader_hex_file="optiboot.hex",
+            )
+        )
+        self.assertIn("flash:w:app.hex:i", command)
+        self.assertIn("flash:w:optiboot.hex:i", command)
+        self.assertIn("hfuse:w:0xDE:m", command)
+        self.assertEqual(command[-1], "lock:w:0x0F:m")
+
+    def test_preserve_mode_requires_bootloader_image(self) -> None:
+        with self.assertRaisesRegex(FlashError, "Bootloader HEX"):
+            build_isp_app_command(
+                IspAppOptions(
+                    "avrdude", "app.hex", preserve_bootloader=True
+                )
+            )
 
 
 class ProgressTests(unittest.TestCase):

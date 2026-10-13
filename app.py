@@ -20,8 +20,11 @@ from arduino_flasher import (
     AvrdudeProgressParser,
     BootloaderOptions,
     FlashError,
+    HexInfo,
+    IspAppOptions,
     build_app_command,
     build_bootloader_command,
+    build_isp_app_command,
     find_avrdude,
     find_optiboot_hex,
     list_serial_ports,
@@ -29,7 +32,7 @@ from arduino_flasher import (
 )
 
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_TITLE = f"ATmega328P Firmware Tool v{APP_VERSION}"
 
 
@@ -37,8 +40,8 @@ class FirmwareTool(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(APP_TITLE)
-        self.geometry("900x700")
-        self.minsize(760, 600)
+        self.geometry("900x780")
+        self.minsize(760, 700)
 
         self._events: queue.Queue[tuple[str, object]] = queue.Queue()
         self._process: subprocess.Popen[bytes] | None = None
@@ -52,10 +55,13 @@ class FirmwareTool(tk.Tk):
         self.config_path = tk.StringVar()
         self.port = tk.StringVar()
         self.programmer = tk.StringVar(value="usbasp")
+        self.isp_app_programmer = tk.StringVar(value="usbtiny")
         self.boot_baud = tk.StringVar()
         self.bitclock = tk.StringVar()
         self.app_protocol = tk.StringVar(value="arduino")
         self.app_baud = tk.StringVar(value="115200")
+        self.preserve_bootloader = tk.BooleanVar(value=False)
+        self.bootloader_hex_path = tk.StringVar(value=find_optiboot_hex())
         self.low_fuse = tk.StringVar(value="0xFF")
         self.high_fuse = tk.StringVar(value="0xDE")
         self.extended_fuse = tk.StringVar(value="0xFD")
@@ -66,6 +72,7 @@ class FirmwareTool(tk.Tk):
 
         self._build_ui()
         self._mode_changed()
+        self._preserve_changed()
         self._refresh_ports()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(80, self._poll_events)
@@ -78,20 +85,28 @@ class FirmwareTool(tk.Tk):
 
         mode_box = ttk.LabelFrame(root, text="燒錄類型", padding=10)
         mode_box.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        mode_box.columnconfigure(0, weight=1)
         ttk.Radiobutton(
             mode_box,
             text="Bootloader（需 ISP Programmer，會設定 Uno fuse）",
             variable=self.mode,
             value="bootloader",
             command=self._mode_changed,
-        ).pack(side="left", padx=(0, 24))
+        ).grid(row=0, column=0, sticky="w")
         ttk.Radiobutton(
             mode_box,
             text="一般 App FW（透過 Optiboot 序列埠）",
             variable=self.mode,
-            value="app",
+            value="app_serial",
             command=self._mode_changed,
-        ).pack(side="left")
+        ).grid(row=1, column=0, sticky="w", pady=(4, 0))
+        ttk.Radiobutton(
+            mode_box,
+            text="一般 App FW（透過 ISP Programmer／USBtinyISP）",
+            variable=self.mode,
+            value="app_isp",
+            command=self._mode_changed,
+        ).grid(row=2, column=0, sticky="w", pady=(4, 0))
 
         file_box = ttk.LabelFrame(root, text="工具與韌體", padding=10)
         file_box.grid(row=1, column=0, sticky="ew", pady=(0, 10))
@@ -107,10 +122,14 @@ class FirmwareTool(tk.Tk):
         settings.columnconfigure(1, weight=1)
         settings.columnconfigure(3, weight=1)
 
-        ttk.Label(settings, text="連接埠").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        self.port_label = ttk.Label(settings, text="連接埠")
+        self.port_label.grid(row=0, column=0, sticky="w", padx=(0, 8))
         self.port_combo = ttk.Combobox(settings, textvariable=self.port)
         self.port_combo.grid(row=0, column=1, columnspan=2, sticky="ew")
-        ttk.Button(settings, text="重新整理", command=self._refresh_ports).grid(
+        self.refresh_ports_button = ttk.Button(
+            settings, text="重新整理", command=self._refresh_ports
+        )
+        self.refresh_ports_button.grid(
             row=0, column=3, sticky="e", padx=(8, 0)
         )
 
@@ -151,22 +170,73 @@ class FirmwareTool(tk.Tk):
                 row=2, column=index, sticky="ew", padx=(0, 8)
             )
 
-        self.app_frame = ttk.Frame(settings)
-        self.app_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0))
-        self.app_frame.columnconfigure(1, weight=1)
-        self.app_frame.columnconfigure(3, weight=1)
-        ttk.Label(self.app_frame, text="Protocol").grid(row=0, column=0, sticky="w")
+        self.app_serial_frame = ttk.Frame(settings)
+        self.app_serial_frame.grid(
+            row=2, column=0, columnspan=4, sticky="ew", pady=(10, 0)
+        )
+        self.app_serial_frame.columnconfigure(1, weight=1)
+        self.app_serial_frame.columnconfigure(3, weight=1)
+        ttk.Label(self.app_serial_frame, text="Protocol").grid(
+            row=0, column=0, sticky="w"
+        )
         ttk.Combobox(
-            self.app_frame,
+            self.app_serial_frame,
             textvariable=self.app_protocol,
             values=("arduino", "wiring", "stk500v1"),
         ).grid(row=0, column=1, sticky="ew", padx=(8, 16))
-        ttk.Label(self.app_frame, text="Baud").grid(row=0, column=2, sticky="w")
+        ttk.Label(self.app_serial_frame, text="Baud").grid(
+            row=0, column=2, sticky="w"
+        )
         ttk.Combobox(
-            self.app_frame,
+            self.app_serial_frame,
             textvariable=self.app_baud,
             values=("115200", "57600", "19200"),
         ).grid(row=0, column=3, sticky="ew", padx=(8, 0))
+
+        self.app_isp_frame = ttk.Frame(settings)
+        self.app_isp_frame.grid(
+            row=3, column=0, columnspan=4, sticky="ew", pady=(10, 0)
+        )
+        self.app_isp_frame.columnconfigure(1, weight=1)
+        self.app_isp_frame.columnconfigure(3, weight=1)
+        ttk.Label(self.app_isp_frame, text="Programmer").grid(
+            row=0, column=0, sticky="w"
+        )
+        ttk.Combobox(
+            self.app_isp_frame,
+            textvariable=self.isp_app_programmer,
+            values=("usbtiny", "usbasp", "atmelice_isp"),
+        ).grid(row=0, column=1, sticky="ew", padx=(8, 16))
+        ttk.Label(self.app_isp_frame, text="Bitclock -B（選填）").grid(
+            row=0, column=2, sticky="w"
+        )
+        ttk.Entry(self.app_isp_frame, textvariable=self.bitclock).grid(
+            row=0, column=3, sticky="ew", padx=(8, 0)
+        )
+        ttk.Checkbutton(
+            self.app_isp_frame,
+            text="同次重燒 Optiboot，保留序列埠上傳能力",
+            variable=self.preserve_bootloader,
+            command=self._preserve_changed,
+        ).grid(row=1, column=0, columnspan=4, sticky="w", pady=(10, 4))
+        ttk.Label(self.app_isp_frame, text="Bootloader HEX").grid(
+            row=2, column=0, sticky="w"
+        )
+        self.bootloader_hex_entry = ttk.Entry(
+            self.app_isp_frame, textvariable=self.bootloader_hex_path
+        )
+        self.bootloader_hex_entry.grid(
+            row=2, column=1, columnspan=2, sticky="ew", padx=(8, 8)
+        )
+        self.bootloader_hex_button = ttk.Button(
+            self.app_isp_frame, text="瀏覽…", command=self._browse_bootloader_hex
+        )
+        self.bootloader_hex_button.grid(row=2, column=3, sticky="e")
+        ttk.Label(
+            self.app_isp_frame,
+            text="未勾選時會清除原 Bootloader；勾選時使用 Uno 16 MHz fuse/lock 設定。",
+            foreground="#b45309",
+        ).grid(row=3, column=0, columnspan=4, sticky="w", pady=(8, 0))
 
         action_frame = ttk.Frame(root)
         action_frame.grid(row=3, column=0, sticky="ew", pady=(0, 10))
@@ -242,13 +312,41 @@ class FirmwareTool(tk.Tk):
         if selected:
             self.config_path.set(selected)
 
+    def _browse_bootloader_hex(self) -> None:
+        initial = Path(self.bootloader_hex_path.get()).expanduser().parent
+        selected = filedialog.askopenfilename(
+            title="選擇 Bootloader Intel HEX",
+            initialdir=initial if initial.is_dir() else Path.cwd(),
+            filetypes=(("Intel HEX", "*.hex"), ("所有檔案", "*.*")),
+        )
+        if selected:
+            self.bootloader_hex_path.set(selected)
+
     def _mode_changed(self) -> None:
-        if self.mode.get() == "bootloader":
+        mode = self.mode.get()
+        self.boot_frame.grid_remove()
+        self.app_serial_frame.grid_remove()
+        self.app_isp_frame.grid_remove()
+        if mode == "bootloader":
             self.boot_frame.grid()
-            self.app_frame.grid_remove()
+            self.port_label.configure(text="連接埠")
+            self.port_combo.configure(state="normal")
+            self.refresh_ports_button.configure(state="normal")
+        elif mode == "app_serial":
+            self.app_serial_frame.grid()
+            self.port_label.configure(text="連接埠")
+            self.port_combo.configure(state="normal")
+            self.refresh_ports_button.configure(state="normal")
         else:
-            self.boot_frame.grid_remove()
-            self.app_frame.grid()
+            self.app_isp_frame.grid()
+            self.port_label.configure(text="連接埠（USB ISP 不使用）")
+            self.port_combo.configure(state="disabled")
+            self.refresh_ports_button.configure(state="disabled")
+
+    def _preserve_changed(self) -> None:
+        state = "normal" if self.preserve_bootloader.get() else "disabled"
+        self.bootloader_hex_entry.configure(state=state)
+        self.bootloader_hex_button.configure(state=state)
 
     def _refresh_ports(self) -> None:
         current = self.port.get()
@@ -268,9 +366,11 @@ class FirmwareTool(tk.Tk):
         displayed = self.port.get().strip()
         return self._port_map.get(displayed, displayed)
 
-    def _build_command(self) -> tuple[list[str], object]:
+    def _build_command(self) -> tuple[list[str], list[tuple[str, HexInfo]]]:
         hex_path = str(Path(self.hex_path.get()).expanduser())
         info = validate_hex_file(hex_path)
+        mode = self.mode.get()
+        image_info = [("Bootloader HEX" if mode == "bootloader" else "App HEX", info)]
         avrdude = self.avrdude_path.get().strip()
         if not avrdude:
             raise FlashError("請指定 avrdude 執行檔。")
@@ -280,7 +380,7 @@ class FirmwareTool(tk.Tk):
                 raise FlashError(f"找不到 avrdude：{executable}")
             avrdude = str(executable)
 
-        if self.mode.get() == "bootloader":
+        if mode == "bootloader":
             programmer = self.programmer.get().strip()
             # USB programmers address the device over USB and must not receive a
             # randomly selected UART path. Serial-based ISP programmers do need it.
@@ -303,7 +403,7 @@ class FirmwareTool(tk.Tk):
             if not options.programmer:
                 raise FlashError("請指定 ISP Programmer。")
             command = build_bootloader_command(options)
-        else:
+        elif mode == "app_serial":
             options = AppOptions(
                 avrdude=avrdude,
                 config_file=self.config_path.get(),
@@ -315,19 +415,49 @@ class FirmwareTool(tk.Tk):
             if not options.protocol:
                 raise FlashError("請指定 avrdude protocol。")
             command = build_app_command(options)
-        return command, info
+        else:
+            preserve = self.preserve_bootloader.get()
+            bootloader_hex = ""
+            if preserve:
+                bootloader_hex = str(Path(self.bootloader_hex_path.get()).expanduser())
+                bootloader_info = validate_hex_file(bootloader_hex)
+                if (
+                    info.highest_address is not None
+                    and bootloader_info.lowest_address is not None
+                    and info.highest_address >= bootloader_info.lowest_address
+                ):
+                    raise FlashError(
+                        "App HEX 與 Bootloader HEX 位址重疊，請確認板型與編譯設定。"
+                    )
+                image_info.append(("Bootloader HEX", bootloader_info))
+            options = IspAppOptions(
+                avrdude=avrdude,
+                config_file=self.config_path.get(),
+                hex_file=hex_path,
+                programmer=self.isp_app_programmer.get().strip(),
+                bitclock=self.bitclock.get(),
+                preserve_bootloader=preserve,
+                bootloader_hex_file=bootloader_hex,
+            )
+            command = build_isp_app_command(options)
+        return command, image_info
 
     def _start_flash(self) -> None:
         if self._running:
             return
         try:
-            command, info = self._build_command()
+            command, image_info = self._build_command()
         except FlashError as exc:
             messagebox.showerror("設定錯誤", str(exc), parent=self)
             return
 
-        kind = "Bootloader" if self.mode.get() == "bootloader" else "App FW"
-        if self.mode.get() == "bootloader":
+        mode = self.mode.get()
+        kind = {
+            "bootloader": "Bootloader",
+            "app_serial": "App FW（序列埠）",
+            "app_isp": "App FW（ISP）",
+        }[mode]
+        if mode == "bootloader":
             confirmed = messagebox.askyesno(
                 "確認燒錄 Bootloader",
                 "此操作會執行 Chip Erase、改寫 fuse/lock bits，並燒錄 Bootloader。\n\n"
@@ -337,15 +467,36 @@ class FirmwareTool(tk.Tk):
             )
             if not confirmed:
                 return
+        elif mode == "app_isp":
+            if self.preserve_bootloader.get():
+                warning = (
+                    "此操作會執行 Chip Erase、改寫 Uno fuse/lock bits，並依序燒錄 "
+                    "App FW 與 Bootloader。\n\n請確認目標為 ATmega328P 16 MHz，是否繼續？"
+                )
+            else:
+                warning = (
+                    "此操作會執行 Chip Erase 並直接燒錄 App FW，現有 Bootloader 將被清除。"
+                    "\n\n之後若要使用序列埠上傳，必須重新燒錄 Bootloader。是否繼續？"
+                )
+            if not messagebox.askyesno(
+                "確認透過 ISP 燒錄 App FW",
+                warning,
+                icon="warning",
+                parent=self,
+            ):
+                return
 
         self._clear_log()
-        address = (
-            f"0x{info.lowest_address:04X}–0x{info.highest_address:04X}"
-            if info.lowest_address is not None and info.highest_address is not None
-            else "未知"
-        )
         self._append_log(f"[{self._timestamp()}] 準備燒錄 {kind}\n")
-        self._append_log(f"HEX：{info.data_bytes} bytes，位址 {address}\n")
+        for label, info in image_info:
+            address = (
+                f"0x{info.lowest_address:04X}–0x{info.highest_address:04X}"
+                if info.lowest_address is not None and info.highest_address is not None
+                else "未知"
+            )
+            self._append_log(
+                f"{label}：{info.data_bytes} bytes，位址 {address}\n"
+            )
         self._append_log(f"命令：{shlex.join(command)}\n\n")
         self.progress.set(2)
         self.status_text.set("正在啟動 avrdude…")
